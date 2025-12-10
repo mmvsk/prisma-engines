@@ -3598,9 +3598,11 @@ dependencies = [
 name = "query-builder"
 version = "0.1.0"
 dependencies = [
+ "psl",
  "query-structure",
  "query-template",
  "serde",
+ "serde_repr",
 ]
 
 [[package]]

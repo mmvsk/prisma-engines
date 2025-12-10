@@ -30,7 +30,7 @@ use quaint::{
 };
 #[cfg(feature = "relation_joins")]
 use query_builder::GetRelatedRecordsQuery;
-use query_builder::{Chunkable, CreateRecord, CreateRecordDefaultsQuery, DbQuery, QueryBuilder};
+use query_builder::{Chunkable, ColumnType, CreateRecord, CreateRecordDefaultsQuery, DbQuery, QueryBuilder, extract_column_types};
 use query_structure::{
     AggregationSelection, DatasourceFieldName, FieldSelection, Filter, Model, ModelProjection, QueryArguments,
     RecordFilter, RelationField, RelationLoadStrategy, ScalarField, SelectionResult, WriteArgs, WriteOperation,
@@ -70,6 +70,7 @@ impl<'a, V> SqlQueryBuilder<'a, V> {
         &self,
         query: impl Into<Query<'a>>,
         chunkable: Chunkable,
+        column_types: Option<Vec<Option<ColumnType>>>,
     ) -> Result<DbQuery, Box<dyn std::error::Error + Send + Sync>>
     where
         V: Visitor<'a>,
@@ -93,6 +94,7 @@ impl<'a, V> SqlQueryBuilder<'a, V> {
             args,
             arg_types,
             chunkable,
+            column_types,
         })
     }
 
@@ -118,6 +120,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         relation_load_strategy: RelationLoadStrategy,
     ) -> Result<Vec<DbQuery>, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&query_arguments);
+        let column_types = Some(extract_column_types(selected_fields));
         let queries: Vec<_> = match relation_load_strategy {
             RelationLoadStrategy::Join => {
                 #[cfg(not(feature = "relation_joins"))]
@@ -161,7 +164,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
 
         queries
             .into_iter()
-            .map(|query| self.convert_query(query, chunkable))
+            .map(|query| self.convert_query(query, chunkable, column_types.clone()))
             .collect()
     }
 
@@ -181,6 +184,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         use select::JoinConditionExt;
 
         let chunkable = Chunkable::from(&query_arguments);
+        let column_types = Some(extract_column_types(selected_fields));
         let linking_field_alias = self.generate_linking_field_alias(&linkage);
         let (rf, conditions_per_field) = linkage.into_parent_field_and_conditions();
 
@@ -231,7 +235,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
             .into_iter()
             .fold(select, |acc, val| acc.value(val));
 
-        let query = self.convert_query(select, chunkable)?;
+        let query = self.convert_query(select, chunkable, column_types)?;
         Ok(GetRelatedRecordsQuery {
             query,
             linking_field_alias,
@@ -251,7 +255,8 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         } else {
             read::group_by_aggregate(model, args, selections, group_by, having, &self.context)
         };
-        self.convert_query(query, Chunkable::No)
+        // Aggregates have dynamic column types, so we don't provide column_types here
+        self.convert_query(query, Chunkable::No, None)
     }
 
     fn build_create_record(
@@ -262,6 +267,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
     ) -> Result<CreateRecord, Box<dyn std::error::Error + Send + Sync>> {
         // Inserts are always chunkable.
         let chunkable = Chunkable::Yes;
+        let column_types = Some(extract_column_types(selected_fields));
         let id_selection = model.shard_aware_primary_identifier();
 
         let (select_defaults, last_insert_id_field, merge_values) = if self.context.sql_family().is_mysql() {
@@ -281,7 +287,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
                 }
 
                 Some(CreateRecordDefaultsQuery {
-                    query: self.convert_query(query, Chunkable::No)?,
+                    query: self.convert_query(query, Chunkable::No, None)?,
                     field_placeholders,
                 })
             } else {
@@ -306,7 +312,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
 
         Ok(CreateRecord {
             select_defaults,
-            insert_query: self.convert_query(query, chunkable)?,
+            insert_query: self.convert_query(query, chunkable, column_types)?,
             last_insert_id_field,
             merge_values,
         })
@@ -321,9 +327,10 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
     ) -> Result<Vec<DbQuery>, Box<dyn std::error::Error + Send + Sync>> {
         // Inserts are always chunkable.
         let chunkable = Chunkable::Yes;
+        let column_types = selected_fields.map(extract_column_types);
         let projection = selected_fields.map(ModelProjection::from);
         let query = write::generate_insert_statements(model, args, skip_duplicates, projection.as_ref(), &self.context);
-        query.into_iter().map(|q| self.convert_query(q, chunkable)).collect()
+        query.into_iter().map(|q| self.convert_query(q, chunkable, column_types.clone())).collect()
     }
 
     fn build_update(
@@ -334,11 +341,12 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         selected_fields: Option<&FieldSelection>,
     ) -> Result<DbQuery, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&record_filter.filter);
+        let column_types = selected_fields.map(extract_column_types);
         match selected_fields {
             Some(selected_fields) => {
                 let projection = ModelProjection::from(selected_fields);
                 let query = update::update_one_with_selection(model, record_filter, args, &projection, &self.context);
-                self.convert_query(query, chunkable)
+                self.convert_query(query, chunkable, column_types)
             }
             None => {
                 let selection_results = record_filter
@@ -356,7 +364,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
                 .exactly_one()
                 .expect("should generate exactly one update query");
 
-                self.convert_query(query, chunkable)
+                self.convert_query(query, chunkable, column_types)
             }
         }
     }
@@ -370,10 +378,11 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         limit: Option<usize>,
     ) -> Result<Vec<DbQuery>, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&record_filter.filter);
+        let column_types = selected_fields.map(extract_column_types);
         let projection = selected_fields.map(ModelProjection::from);
         write::generate_update_statements(model, record_filter, args, projection.as_ref(), limit, &self.context)
             .into_iter()
-            .map(|query| self.convert_query(query, chunkable))
+            .map(|query| self.convert_query(query, chunkable, column_types.clone()))
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -387,6 +396,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         unique_constraints: &[ScalarField],
     ) -> Result<DbQuery, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&filter);
+        let column_types = Some(extract_column_types(selected_fields));
         let query = write::native_upsert(
             model,
             filter,
@@ -396,7 +406,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
             unique_constraints,
             &self.context,
         );
-        self.convert_query(query, chunkable)
+        self.convert_query(query, chunkable, column_types)
     }
 
     fn build_m2m_connect(
@@ -438,7 +448,8 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
             ExpressionKind::Parameterized(Value::opaque(call, typ)),
         );
         let query = insert.on_conflict(OnConflict::DoNothing);
-        self.convert_query(query, chunkable)
+        // M2M connect doesn't return fields, so no column_types
+        self.convert_query(query, chunkable, None)
     }
 
     fn build_m2m_disconnect(
@@ -450,7 +461,8 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         // Delete by parent and child ids is always chunkable.
         let chunkable = Chunkable::Yes;
         let query = write::delete_relation_table_records(&field, parent_id, child_ids, &self.context);
-        self.convert_query(query, chunkable)
+        // M2M disconnect doesn't return fields, so no column_types
+        self.convert_query(query, chunkable, None)
     }
 
     fn build_delete(
@@ -460,6 +472,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         selected_fields: Option<&FieldSelection>,
     ) -> Result<DbQuery, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&record_filter.filter);
+        let column_types = selected_fields.map(extract_column_types);
         let query = if let Some(selected_fields) = selected_fields {
             write::delete_returning(model, record_filter.filter, &selected_fields.into(), &self.context)
         } else {
@@ -468,7 +481,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
                 .exactly_one()
                 .expect("should generate exactly one delete")
         };
-        self.convert_query(query, chunkable)
+        self.convert_query(query, chunkable, column_types)
     }
 
     fn build_deletes(
@@ -478,9 +491,10 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
         limit: Option<usize>,
     ) -> Result<Vec<DbQuery>, Box<dyn std::error::Error + Send + Sync>> {
         let chunkable = Chunkable::from(&record_filter.filter);
+        // build_deletes doesn't return fields, so no column_types
         let queries = write::generate_delete_statements(model, record_filter, limit, &self.context)
             .into_iter()
-            .map(|q| self.convert_query(q, chunkable))
+            .map(|q| self.convert_query(q, chunkable, None))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(queries)
     }
@@ -501,6 +515,7 @@ impl<'a, V: Visitor<'a>> QueryBuilder for SqlQueryBuilder<'a, V> {
                 .map(|arg| convert::prisma_type_to_arg_type(&arg.r#type()))
                 .collect(),
             args: params,
+            column_types: None,
         })
     }
 }

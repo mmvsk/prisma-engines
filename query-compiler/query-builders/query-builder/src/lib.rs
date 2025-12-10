@@ -1,8 +1,11 @@
+use psl::schema_ast::ast::FieldArity;
 use query_structure::{
     AggregationSelection, FieldSelection, Filter, Model, Placeholder, PrismaValue, QueryArguments, RecordFilter,
-    RelationField, RelationLoadStrategy, ScalarCondition, ScalarField, SelectedField, SelectionResult, WriteArgs,
+    RelationField, RelationLoadStrategy, ScalarCondition, ScalarField, SelectedField, SelectionResult, TypeIdentifier,
+    WriteArgs,
 };
 use serde::Serialize;
+use serde_repr::Serialize_repr;
 use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use std::{collections::HashMap, fmt};
@@ -216,6 +219,156 @@ impl fmt::Display for RelationLinkage {
     }
 }
 
+/// Column type information for driver adapters.
+///
+/// These values match the TypeScript `ColumnTypeEnum` in `@prisma/driver-adapter-utils`.
+/// The numeric representation is important for serialization compatibility with the
+/// TypeScript query interpreter.
+#[derive(Debug, Clone, Copy, Serialize_repr)]
+#[repr(u8)]
+pub enum ColumnType {
+    // Scalars
+    Int32 = 0,
+    Int64 = 1,
+    Float = 2,
+    Double = 3,
+    Numeric = 4,
+    Boolean = 5,
+    Character = 6,
+    Text = 7,
+    Date = 8,
+    Time = 9,
+    DateTime = 10,
+    Json = 11,
+    Enum = 12,
+    Bytes = 13,
+    Set = 14,
+    Uuid = 15,
+    // Arrays (64+)
+    Int32Array = 64,
+    Int64Array = 65,
+    FloatArray = 66,
+    DoubleArray = 67,
+    NumericArray = 68,
+    BooleanArray = 69,
+    CharacterArray = 70,
+    TextArray = 71,
+    DateArray = 72,
+    TimeArray = 73,
+    DateTimeArray = 74,
+    JsonArray = 75,
+    EnumArray = 76,
+    BytesArray = 77,
+    UuidArray = 78,
+    // Custom
+    UnknownNumber = 128,
+}
+
+impl ColumnType {
+    /// Convert a Prisma TypeIdentifier and arity to a ColumnType.
+    ///
+    /// Returns `None` for types that don't have a direct mapping (e.g., Unsupported, Extension).
+    pub fn from_type_identifier(type_id: &TypeIdentifier, arity: FieldArity) -> Option<Self> {
+        let is_list = arity.is_list();
+
+        let column_type = match type_id {
+            TypeIdentifier::String => {
+                if is_list {
+                    ColumnType::TextArray
+                } else {
+                    ColumnType::Text
+                }
+            }
+            TypeIdentifier::Int => {
+                if is_list {
+                    ColumnType::Int32Array
+                } else {
+                    ColumnType::Int32
+                }
+            }
+            TypeIdentifier::BigInt => {
+                if is_list {
+                    ColumnType::Int64Array
+                } else {
+                    ColumnType::Int64
+                }
+            }
+            TypeIdentifier::Float => {
+                if is_list {
+                    ColumnType::DoubleArray
+                } else {
+                    ColumnType::Double
+                }
+            }
+            TypeIdentifier::Decimal => {
+                if is_list {
+                    ColumnType::NumericArray
+                } else {
+                    ColumnType::Numeric
+                }
+            }
+            TypeIdentifier::Boolean => {
+                if is_list {
+                    ColumnType::BooleanArray
+                } else {
+                    ColumnType::Boolean
+                }
+            }
+            TypeIdentifier::Enum(_) => {
+                if is_list {
+                    ColumnType::EnumArray
+                } else {
+                    ColumnType::Enum
+                }
+            }
+            TypeIdentifier::UUID => {
+                if is_list {
+                    ColumnType::UuidArray
+                } else {
+                    ColumnType::Uuid
+                }
+            }
+            TypeIdentifier::Json => {
+                if is_list {
+                    ColumnType::JsonArray
+                } else {
+                    ColumnType::Json
+                }
+            }
+            TypeIdentifier::DateTime => {
+                if is_list {
+                    ColumnType::DateTimeArray
+                } else {
+                    ColumnType::DateTime
+                }
+            }
+            TypeIdentifier::Bytes => {
+                if is_list {
+                    ColumnType::BytesArray
+                } else {
+                    ColumnType::Bytes
+                }
+            }
+            // Extension and Unsupported types don't have a direct mapping
+            TypeIdentifier::Extension(_) | TypeIdentifier::Unsupported => return None,
+        };
+
+        Some(column_type)
+    }
+}
+
+/// Extract column types from a FieldSelection.
+///
+/// Returns a vector of optional ColumnTypes corresponding to each selected field.
+/// Returns `None` for fields that don't have a direct column type mapping (e.g., composites).
+pub fn extract_column_types(field_selection: &FieldSelection) -> Vec<Option<ColumnType>> {
+    field_selection
+        .type_identifiers_with_arities()
+        .into_iter()
+        .map(|(type_id, arity)| ColumnType::from_type_identifier(&type_id, arity))
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum DbQuery {
@@ -224,6 +377,8 @@ pub enum DbQuery {
         sql: String,
         args: Vec<PrismaValue>,
         arg_types: Vec<ArgType>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column_types: Option<Vec<Option<ColumnType>>>,
     },
     #[serde(rename_all = "camelCase")]
     TemplateSql {
@@ -232,6 +387,8 @@ pub enum DbQuery {
         arg_types: Vec<DynamicArgType>,
         placeholder_format: PlaceholderFormat,
         chunkable: Chunkable,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column_types: Option<Vec<Option<ColumnType>>>,
     },
 }
 
